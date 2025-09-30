@@ -1,379 +1,317 @@
-# app.py — Side-by-Side Diff + T-SQL → Snowflake (Streamlit Cloud friendly)
-
-import io
-import re
-import difflib
-import html
-from typing import List, Dict, Tuple, Optional
+from datetime import date, datetime, timedelta
+from io import BytesIO
+from typing import Dict, List
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
+from xlsxwriter.utility import xl_col_to_name, xl_rowcol_to_cell
 
-# -------------------------------
-# Page config + header
-# -------------------------------
-st.set_page_config(
-    page_title="Side-by-Side Diff + T-SQL → Snowflake",
-    page_icon="🧪",
-    layout="wide",
-)
-st.title("🧪 Side-by-Side Compare (CSV / SQL / TXT) + Translate T-SQL → Snowflake")
-st.caption(
-    "Upload two files to compare. Green = same, red = different (with inline highlights). "
-    "If File A is SQL/TXT, a Snowflake translation is generated below."
-)
 
-# -------------------------------
-# I/O helpers
-# -------------------------------
+st.set_page_config(page_title="Program Planner & Gantt Exporter", layout="wide")
 
-@st.cache_data(show_spinner=False)
-def _csv_bytes_to_text(csv_bytes: bytes) -> str:
-    """Read CSV bytes into a normalized text with one row per line (comma-joined)."""
-    df = pd.read_csv(io.BytesIO(csv_bytes))
-    lines = []
-    for row in df.itertuples(index=False):
-        vals = ["" if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v) for v in row]
-        lines.append(",".join(vals))
-    return "\n".join(lines)
+# ------------------------------------------------------------------
+# Session state helpers
+# ------------------------------------------------------------------
 
-def read_file_to_text(file) -> str:
-    """
-    Return file contents as text.
-    - CSV → flatten rows (comma-joined) into lines for fair diffing
-    - SQL/TXT → decode bytes as utf-8 (fallback latin-1)
-    """
-    if not file:
-        return ""
-    name = (file.name or "").lower()
+if "program_name" not in st.session_state:
+    st.session_state.program_name = "New Program"
 
-    # Use getvalue() so we don't permanently consume the stream if re-used
-    raw: Optional[bytes] = None
-    try:
-        raw = file.getvalue()
-    except Exception:
-        try:
-            raw = file.read()
-        except Exception:
-            return ""
+if "phases" not in st.session_state:
+    st.session_state.phases: List[Dict] = []
 
-    if raw is None:
-        return ""
+if "tasks" not in st.session_state:
+    st.session_state.tasks: List[Dict] = []
 
-    if name.endswith(".csv"):
-        try:
-            return _csv_bytes_to_text(raw)
-        except Exception as e:
-            return f"ERROR reading CSV: {e}"
 
-    # sql/txt or anything else treated as text
-    try:
-        return raw.decode("utf-8")
-    except Exception:
-        return raw.decode("latin-1", errors="ignore")
+def normalize_filename(name: str) -> str:
+    safe = "".join(ch if ch.isalnum() else "_" for ch in name.strip())
+    return safe.strip("_") or "program_plan"
 
-# -------------------------------
-# Normalization utilities
-# -------------------------------
 
-def strip_sql_comments(sql: str) -> str:
-    sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
-    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
-    return sql
+def as_datetime(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    raise TypeError(f"Unsupported date value: {value!r}")
 
-def normalize_whitespace(sql: str) -> str:
-    return re.sub(r"\s+", " ", sql).strip()
 
-def remove_identifier_brackets(sql: str) -> str:
-    # [Identifier] → Identifier (for comparisons)
-    return re.sub(r"\[([^\]]+)\]", r"\1", sql)
+def build_excel_workbook(program_name: str, phases: List[Dict], tasks: List[Dict]) -> BytesIO:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        workbook = writer.book
+        date_fmt = workbook.add_format({"num_format": "yyyy-mm-dd"})
+        header_fmt = workbook.add_format({
+            "bold": True,
+            "bg_color": "#D9E1F2",
+            "border": 1,
+        })
+        header_date_fmt = workbook.add_format({
+            "bold": True,
+            "bg_color": "#D9E1F2",
+            "border": 1,
+            "num_format": "yyyy-mm-dd",
+        })
+        gantt_fill_fmt = workbook.add_format({"bg_color": "#4472C4"})
+        today_header_fmt = workbook.add_format({"bg_color": "#FFE699", "bold": True, "border": 1})
+        today_column_fmt = workbook.add_format({"bg_color": "#FFF2CC"})
 
-def apply_schema_mapping(sql: str, mapping: Dict[str, str]) -> str:
-    s = sql
-    for src, tgt in mapping.items():
-        s = re.sub(re.escape(src), tgt, s, flags=re.IGNORECASE)
-    return s
+        if phases:
+            df_phases = pd.DataFrame(phases)
+            df_phases.rename(columns={"phase": "Phase", "start": "Start", "finish": "Finish"}, inplace=True)
+            df_phases.sort_values("Start", inplace=True)
+            df_phases.to_excel(writer, sheet_name="Phases", index=False)
+            sheet = writer.sheets["Phases"]
+            sheet.set_column(0, 0, 25)
+            sheet.set_column(1, 2, 15)
+            for row in range(1, len(df_phases) + 1):
+                sheet.write_datetime(row, 1, as_datetime(df_phases.iloc[row - 1]["Start"]), date_fmt)
+                sheet.write_datetime(row, 2, as_datetime(df_phases.iloc[row - 1]["Finish"]), date_fmt)
 
-# -------------------------------
-# T-SQL → Snowflake translator (heuristic)
-# -------------------------------
+        if tasks:
+            df_tasks = pd.DataFrame(tasks)
+            df_tasks.rename(
+                columns={"task": "Task", "phase": "Phase", "start": "Start", "finish": "Finish"},
+                inplace=True,
+            )
+            df_tasks.sort_values(["Phase", "Start", "Finish", "Task"], inplace=True)
+            df_tasks.to_excel(writer, sheet_name="Tasks", index=False)
+            sheet = writer.sheets["Tasks"]
+            sheet.set_column(0, 1, 25)
+            sheet.set_column(2, 3, 15)
+            for row in range(1, len(df_tasks) + 1):
+                sheet.write_datetime(row, 2, as_datetime(df_tasks.iloc[row - 1]["Start"]), date_fmt)
+                sheet.write_datetime(row, 3, as_datetime(df_tasks.iloc[row - 1]["Finish"]), date_fmt)
 
-def t_sql_to_snowflake(tsql: str, schema_map: Dict[str, str]) -> Tuple[str, List[str]]:
-    """
-    Heuristic normalization from common T-SQL idioms to Snowflake-friendly SQL.
-    Non-destructive: focuses on common constructs to reduce manual edits.
-    """
-    notes: List[str] = []
-    s = tsql
+            # Build timeline matrix
+            gantt_sheet = workbook.add_worksheet("Gantt Matrix")
+            writer.sheets["Gantt Matrix"] = gantt_sheet
 
-    before = s
-    s = strip_sql_comments(s)
-    if s != before:
-        notes.append("Removed T-SQL comments.")
+            gantt_sheet.freeze_panes(1, 4)
+            gantt_sheet.set_column(0, 0, 30)
+            gantt_sheet.set_column(1, 1, 18)
+            gantt_sheet.set_column(2, 3, 15)
 
-    def _bracket_to_quoted(m):  # [Identifier] → "Identifier"
-        return f"\"{m.group(1)}\""
-    before = s
-    s = re.sub(r"\[([^\]]+)\]", _bracket_to_quoted, s)
-    if s != before:
-        notes.append("Converted `[Identifier]` to double-quoted identifiers.")
+            # Header labels
+            headers = ["Task", "Phase", "Start", "Finish"]
+            for idx, title in enumerate(headers):
+                gantt_sheet.write(0, idx, title, header_fmt)
 
-    mappings = [
-        (r"\bISNULL\s*\(", "COALESCE(", "Use COALESCE instead of ISNULL."),
-        (r"\bGETDATE\s*\(\s*\)", "CURRENT_TIMESTAMP", "Use CURRENT_TIMESTAMP instead of GETDATE()."),
-        (r"\bLEN\s*\(", "LENGTH(", "Use LENGTH instead of LEN."),
-    ]
-    for pat, rep, msg in mappings:
-        new = re.sub(pat, rep, s, flags=re.IGNORECASE)
-        if new != s:
-            notes.append(msg)
-            s = new
+            all_dates = [*[(p["start"], p["finish"]) for p in phases], *[(t["start"], t["finish"]) for t in tasks]]
+            flattened_dates = [d for pair in all_dates for d in pair]
+            min_date = min(flattened_dates)
+            max_date = max(flattened_dates)
+            date_range = pd.date_range(min_date, max_date, freq="D")
 
-    before = s
-    s = re.sub(r"\bWITH\s*\(\s*NOLOCK\s*\)", "", s, flags=re.IGNORECASE)
-    if s != before:
-        notes.append("Removed `WITH (NOLOCK)`.")
+            date_start_col = len(headers)
+            for offset, dt_value in enumerate(date_range):
+                col = date_start_col + offset
+                gantt_sheet.write_datetime(0, col, dt_value.to_pydatetime(), header_date_fmt)
+                col_letter = xl_col_to_name(col)
 
-    before = s
-    s = re.sub(r"\bCOLLATE\b\s+\w+", "", s, flags=re.IGNORECASE)
-    if s != before:
-        notes.append("Removed `COLLATE` clauses.")
+                # Highlight header if matches today
+                gantt_sheet.conditional_format(0, col, 0, col, {
+                    "type": "formula",
+                    "criteria": f'={col_letter}1=TODAY()',
+                    "format": today_header_fmt,
+                })
 
-    # CONVERT(type, expr) → CAST(expr AS type)
-    def _convert_to_cast(m):
-        dtype, expr = m.group(1).strip(), m.group(2).strip()
-        return f"CAST({expr} AS {dtype})"
-    before = s
-    s = re.sub(r"\bCONVERT\s*\(\s*([A-Za-z0-9_]+)\s*,\s*(.*?)\)", _convert_to_cast, s, flags=re.IGNORECASE)
-    if s != before:
-        notes.append("Converted CONVERT() to CAST().")
+                # Highlight entire column if it is today
+                gantt_sheet.conditional_format(1, col, len(tasks), col, {
+                    "type": "formula",
+                    "criteria": f'=${col_letter}$1=TODAY()',
+                    "format": today_column_fmt,
+                })
 
-    # SELECT TOP n → append LIMIT n (best-effort)
-    top = re.search(r"\bSELECT\s+TOP\s+(\d+)\s+", s, flags=re.IGNORECASE)
-    if top:
-        n = top.group(1)
-        notes.append(f"Translated TOP {n} to LIMIT {n}.")
-        s = re.sub(r"(\bSELECT\s+)TOP\s+\d+\s+", r"\1", s, flags=re.IGNORECASE)
-        if not re.search(r"\bLIMIT\s+\d+\b", s, flags=re.IGNORECASE):
-            s = re.sub(r";\s*$", "", s).strip() + f"\nLIMIT {n};"
+            # Write task rows and formulas
+            for row_idx, task in enumerate(tasks, start=1):
+                gantt_sheet.write(row_idx, 0, task["task"])
+                gantt_sheet.write(row_idx, 1, task["phase"])
+                gantt_sheet.write_datetime(row_idx, 2, as_datetime(task["start"]), date_fmt)
+                gantt_sheet.write_datetime(row_idx, 3, as_datetime(task["finish"]), date_fmt)
 
-    if schema_map:
-        before = s
-        s = apply_schema_mapping(s, schema_map)
-        if s != before:
-            notes.append("Applied schema mapping.")
+                start_cell = xl_rowcol_to_cell(row_idx, 2, row_abs=True, col_abs=True)
+                finish_cell = xl_rowcol_to_cell(row_idx, 3, row_abs=True, col_abs=True)
 
-    s = normalize_whitespace(s)
-    return s, notes
+                for offset in range(len(date_range)):
+                    col = date_start_col + offset
+                    header_cell = xl_rowcol_to_cell(0, col, row_abs=True, col_abs=True)
+                    formula = f'=IF(AND({header_cell}>={start_cell},{header_cell}<={finish_cell}),1,"")'
+                    gantt_sheet.write_formula(row_idx, col, formula)
 
-# -------------------------------
-# Inline diff helpers (token-level)
-# -------------------------------
+            if date_range.size:
+                date_end_col = date_start_col + len(date_range) - 1
+                gantt_sheet.conditional_format(1, date_start_col, len(tasks), date_end_col, {
+                    "type": "cell",
+                    "criteria": "==",
+                    "value": 1,
+                    "format": gantt_fill_fmt,
+                })
 
-def _tokenize_for_inline(s: str) -> List[str]:
-    return re.split(r"(\W+)", s)
+            gantt_sheet.autofilter(0, 0, len(tasks), 3)
+            gantt_sheet.write(0, 0, "Task", header_fmt)
 
-def inline_diff_html(a_line: str, b_line: str) -> Tuple[str, str]:
-    a_toks = _tokenize_for_inline(a_line)
-    b_toks = _tokenize_for_inline(b_line)
-    sm = difflib.SequenceMatcher(None, a_toks, b_toks)
+    output.seek(0)
+    return output
 
-    a_out, b_out = [], []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            a_out.append(html.escape("".join(a_toks[i1:i2])))
-            b_out.append(html.escape("".join(b_toks[j1:j2])))
-        elif tag == "replace":
-            a_seg = html.escape("".join(a_toks[i1:i2]))
-            b_seg = html.escape("".join(b_toks[j1:j2]))
-            if a_seg:
-                a_out.append("<span class='seg-repl'>{}</span>".format(a_seg))
-            if b_seg:
-                b_out.append("<span class='seg-repl'>{}</span>".format(b_seg))
-        elif tag == "delete":
-            a_seg = html.escape("".join(a_toks[i1:i2]))
-            if a_seg:
-                a_out.append("<span class='seg-del'>{}</span>".format(a_seg))
-        elif tag == "insert":
-            b_seg = html.escape("".join(b_toks[j1:j2]))
-            if b_seg:
-                b_out.append("<span class='seg-ins'>{}</span>".format(b_seg))
-    return "".join(a_out), "".join(b_out)
 
-# -------------------------------
-# Side-by-side diff table (high-contrast + inline highlights)
-# -------------------------------
+# ------------------------------------------------------------------
+# Layout
+# ------------------------------------------------------------------
 
-def side_by_side_html(a_text: str, b_text: str) -> str:
-    a_lines = a_text.splitlines()
-    b_lines = b_text.splitlines()
-    sm = difflib.SequenceMatcher(None, a_lines, b_lines)
-
-    rows = []
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            for k in range(i2 - i1):
-                a_line = html.escape(a_lines[i1 + k])
-                b_line = html.escape(b_lines[j1 + k])
-                rows.append(
-                    "<tr>"
-                    f"<td class='ok'><pre>{a_line}</pre></td>"
-                    f"<td class='ok'><pre>{b_line}</pre></td>"
-                    "</tr>"
-                )
-        elif tag == "replace":
-            maxlen = max(i2 - i1, j2 - j1)
-            for k in range(maxlen):
-                a_line = a_lines[i1 + k] if i1 + k < i2 else ""
-                b_line = b_lines[j1 + k] if j1 + k < j2 else ""
-                a_html, b_html = inline_diff_html(a_line, b_line)
-                rows.append(
-                    "<tr>"
-                    f"<td class='bad'><pre>{a_html}</pre></td>"
-                    f"<td class='bad'><pre>{b_html}</pre></td>"
-                    "</tr>"
-                )
-        elif tag == "delete":
-            for k in range(i2 - i1):
-                a_line = a_lines[i1 + k]
-                a_html, _ = inline_diff_html(a_line, "")
-                rows.append(
-                    "<tr>"
-                    f"<td class='bad'><pre>{a_html}</pre></td>"
-                    "<td class='bad'><pre></pre></td>"
-                    "</tr>"
-                )
-        elif tag == "insert":
-            for k in range(j2 - j1):
-                b_line = b_lines[j1 + k]
-                _, b_html = inline_diff_html("", b_line)
-                rows.append(
-                    "<tr>"
-                    "<td class='bad'><pre></pre></td>"
-                    f"<td class='bad'><pre>{b_html}</pre></td>"
-                    "</tr>"
-                )
-
-    rows_html = "\n".join(rows)
-    table = f"""
-    <style>
-      table.diff {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-      table.diff th {{ background: #ffffff; color: #000000; border: 1px solid #ddd; padding: 8px; }}
-      table.diff td {{ vertical-align: top; border: 1px solid #ddd; padding: 8px; }}
-      table.diff td pre {{
-        margin: 0; white-space: pre-wrap; word-wrap: break-word;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      }}
-      table.diff td.ok  {{ background: #c6f6c6; color: #000000; }}
-      table.diff td.bad {{ background: #c62828; color: #ffffff; }}
-      .seg-repl {{ background: rgba(255,255,255,0.25); border-bottom: 2px solid #ffffff; }}
-      .seg-del  {{ background: rgba(255,0,0,0.35); text-decoration: line-through; }}
-      .seg-ins  {{ background: rgba(255,255,255,0.25); font-weight: 700; }}
-      .hdr {{ font-weight: 700; }}
-      .codewrap pre {{
-        background: #f7f7f7; color: #000; border: 1px solid #ddd; border-radius: 6px;
-        padding: 10px; white-space: pre-wrap; word-break: break-word; margin: 0;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      }}
-    </style>
-    <table class="diff">
-      <thead>
-        <tr><th class="hdr">File A (normalized)</th><th class="hdr">File B (normalized)</th></tr>
-      </thead>
-      <tbody>
-        {rows_html}
-      </tbody>
-    </table>
-    """
-    return table
-
-# -------------------------------
-# UI
-# -------------------------------
-
-left, right = st.columns(2)
-with left:
-    st.subheader("Upload File A (T-SQL / CSV / TXT)")
-    file_a = st.file_uploader("Choose File A", type=["sql", "csv", "txt"], key="file_a")
-with right:
-    st.subheader("Upload File B (Snowflake SQL / CSV / TXT)")
-    file_b = st.file_uploader("Choose File B", type=["sql", "csv", "txt"], key="file_b")
+st.title("Program Planner & Gantt Builder")
+st.caption("Capture program phases, tasks, and export an Excel workbook with a ready-to-use Gantt chart matrix and today marker.")
 
 with st.sidebar:
-    st.header("Compare Options")
-    strip_comments_opt = st.checkbox("Strip SQL comments", value=True)
-    case_insensitive = st.checkbox("Case-insensitive compare", value=True)
-    collapse_ws = st.checkbox("Normalize whitespace", value=True)
+    st.header("Program Settings")
+    st.text_input("Program name", key="program_name")
+    if st.button("Clear phases & tasks"):
+        st.session_state.phases = []
+        st.session_state.tasks = []
+        st.experimental_rerun()
 
-    st.markdown("---")
-    st.subheader("Schema / Prefix Mapping")
-    mapping_text = st.text_area("Mappings", value="dbo. -> PUBLIC.\n[dbo]. -> PUBLIC.", height=80)
-    threshold = st.slider("Pass threshold (%)", 50, 100, 95, 1)
+st.markdown("### Define Your Program")
+phase_col, task_col = st.columns(2, gap="large")
 
-# Parse schema map
-schema_map: Dict[str, str] = {}
-for line in (mapping_text or "").splitlines():
-    if "->" in line:
-        l, r = line.split("->", 1)
-        schema_map[l.strip()] = r.strip()
+with phase_col:
+    st.subheader("Add a Phase")
+    with st.form("phase_form", clear_on_submit=True):
+        phase_name = st.text_input("Phase name")
+        start_col, end_col = st.columns(2)
+        with start_col:
+            phase_start = st.date_input("Start date", value=date.today())
+        with end_col:
+            phase_finish = st.date_input("Finish date", value=date.today() + timedelta(days=6))
+        submitted = st.form_submit_button("Add phase", use_container_width=True)
 
-# Read & normalize (guard against None)
-text_a_raw = read_file_to_text(file_a) if file_a else ""
-text_b_raw = read_file_to_text(file_b) if file_b else ""
+        if submitted:
+            errors = []
+            if not phase_name.strip():
+                errors.append("Please provide a phase name.")
+            if phase_finish < phase_start:
+                errors.append("Phase finish date cannot be before the start date.")
 
-def normalize_for_compare(s: str) -> str:
-    if not s:
-        return ""
-    out = s
-    if strip_comments_opt:
-        out = strip_sql_comments(out)
-    out = remove_identifier_brackets(out)  # treat [Col] as Col for compare
-    if schema_map:
-        out = apply_schema_mapping(out, schema_map)
-    if case_insensitive:
-        out = out.lower()
-    if collapse_ws:
-        out = normalize_whitespace(out)
-    return out
+            if errors:
+                for err in errors:
+                    st.error(err)
+            else:
+                st.session_state.phases.append(
+                    {
+                        "phase": phase_name.strip(),
+                        "start": phase_start,
+                        "finish": phase_finish,
+                    }
+                )
+                st.success(f"Added phase '{phase_name.strip()}'.")
 
-text_a_norm = normalize_for_compare(text_a_raw)
-text_b_norm = normalize_for_compare(text_b_raw)
-
-# -------------------------------
-# Compare + Render
-# -------------------------------
-if file_a and file_b:
-    ratio = round(100.0 * difflib.SequenceMatcher(None, text_a_norm, text_b_norm).ratio(), 2)
-    st.metric("Congruence Score", f"{ratio:.2f}%")
-    st.write(f"**Status:** {'✅ PASS' if ratio >= threshold else '❌ FAIL'} (threshold = {threshold}%)")
-
-    st.markdown("### Side-by-Side Diff (green = same, red = different; inline highlights show exact changes)")
-    st.markdown(side_by_side_html(text_a_norm, text_b_norm), unsafe_allow_html=True)
-
-    st.markdown("## T-SQL → Snowflake Translation (from File A)")
-    if (file_a.name or "").lower().endswith((".sql", ".txt")):
-        translated_sql, notes = t_sql_to_snowflake(text_a_raw, schema_map)
-
-        st.markdown("**Translated Snowflake SQL (wrapped)**")
-        st.markdown(
-            f"<div class='codewrap'><pre>{html.escape(translated_sql)}</pre></div>",
-            unsafe_allow_html=True,
-        )
-
-        st.download_button(
-            label="⬇️ Download translated_snowflake.sql",
-            data=translated_sql.encode("utf-8"),
-            file_name="translated_snowflake.sql",
-            mime="text/sql",
-        )
-
-        if notes:
-            st.markdown("**What changed**")
-            for n in notes:
-                st.write(f"- {n}")
-        else:
-            st.caption("No T-SQL-specific constructs were found to translate.")
+with task_col:
+    st.subheader("Add a Task")
+    if not st.session_state.phases:
+        st.info("Add a phase first to start defining tasks.")
     else:
-        st.info("File A is not SQL/TXT, so translation is skipped.")
+        phase_options = [p["phase"] for p in st.session_state.phases]
+        with st.form("task_form", clear_on_submit=True):
+            task_name = st.text_input("Task name")
+            phase_choice = st.selectbox("Phase", options=phase_options)
+            selected_phase = next(p for p in st.session_state.phases if p["phase"] == phase_choice)
+
+            task_start = st.date_input(
+                "Task start",
+                value=selected_phase["start"],
+                min_value=selected_phase["start"],
+                max_value=selected_phase["finish"],
+            )
+            task_finish = st.date_input(
+                "Task finish",
+                value=min(selected_phase["finish"], selected_phase["start"] + timedelta(days=6)),
+                min_value=selected_phase["start"],
+                max_value=selected_phase["finish"],
+            )
+            submit_task = st.form_submit_button("Add task", use_container_width=True)
+
+            if submit_task:
+                errors = []
+                if not task_name.strip():
+                    errors.append("Please provide a task name.")
+                if task_finish < task_start:
+                    errors.append("Task finish date cannot be before the start date.")
+
+                if errors:
+                    for err in errors:
+                        st.error(err)
+                else:
+                    st.session_state.tasks.append(
+                        {
+                            "task": task_name.strip(),
+                            "phase": selected_phase["phase"],
+                            "start": task_start,
+                            "finish": task_finish,
+                        }
+                    )
+                    st.success(f"Added task '{task_name.strip()}' to phase '{selected_phase['phase']}'.")
+
+st.markdown("---")
+
+if st.session_state.phases:
+    st.markdown("### Phases")
+    phases_df = pd.DataFrame(st.session_state.phases)
+    phases_df = phases_df.rename(columns={"phase": "Phase", "start": "Start", "finish": "Finish"})
+    phases_df = phases_df.sort_values("Start")
+    st.dataframe(phases_df, use_container_width=True)
+
+if st.session_state.tasks:
+    st.markdown("### Tasks")
+    tasks_df = pd.DataFrame(st.session_state.tasks)
+    tasks_df = tasks_df.rename(columns={"task": "Task", "phase": "Phase", "start": "Start", "finish": "Finish"})
+    tasks_df = tasks_df.sort_values(["Phase", "Start", "Task"])
+    st.dataframe(tasks_df, use_container_width=True)
+
+    st.markdown("### Gantt Chart Preview")
+    chart_df = tasks_df.copy()
+    chart_df["Start"] = pd.to_datetime(chart_df["Start"])
+    chart_df["Finish"] = pd.to_datetime(chart_df["Finish"])
+
+    chart_df["Start Date"] = chart_df["Start"].dt.strftime("%Y-%m-%d")
+    chart_df["Finish Date"] = chart_df["Finish"].dt.strftime("%Y-%m-%d")
+
+    fig = px.timeline(
+        chart_df,
+        x_start="Start",
+        x_end="Finish",
+        y="Task",
+        color="Phase",
+        hover_data=["Phase", "Start Date", "Finish Date"],
+    )
+    fig.update_yaxes(autorange="reversed")
+    today_ts = pd.Timestamp(date.today())
+    fig.add_vline(
+        x=today_ts,
+        line_dash="dash",
+        line_color="red",
+        annotation_text="Today",
+        annotation_position="top left",
+    )
+    fig.update_layout(
+        title=st.session_state.program_name,
+        hovermode="closest",
+        margin=dict(l=0, r=0, t=60, b=20),
+        height=max(360, 60 * len(chart_df)),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### Download Excel Workbook")
+    excel_buffer = build_excel_workbook(st.session_state.program_name, st.session_state.phases, st.session_state.tasks)
+    file_stub = normalize_filename(st.session_state.program_name)
+    st.download_button(
+        label="⬇️ Download program_gantt.xlsx",
+        data=excel_buffer,
+        file_name=f"{file_stub or 'program_plan'}_gantt.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 else:
-    st.info("⬆️ Upload **two files** to compare. Then see the Snowflake translation of File A below.")
+    st.info("Add at least one task to see the Gantt chart and Excel export option.")
