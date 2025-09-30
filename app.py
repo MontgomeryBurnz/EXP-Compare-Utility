@@ -288,11 +288,19 @@ if st.session_state.tasks:
     fig.update_yaxes(autorange="reversed")
     today_ts = pd.Timestamp(date.today())
     fig.add_vline(
-        x=today_ts,
+        x=today_ts.to_pydatetime(),
         line_dash="dash",
         line_color="red",
-        annotation_text="Today",
-        annotation_position="top left",
+    )
+    fig.add_annotation(
+        x=today_ts.to_pydatetime(),
+        y=1,
+        xref="x",
+        yref="paper",
+        text="Today",
+        showarrow=False,
+        borderpad=4,
+        bgcolor="rgba(255,255,255,0.8)",
     )
     fig.update_layout(
         title=st.session_state.program_name,
