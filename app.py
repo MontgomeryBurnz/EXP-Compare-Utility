@@ -373,6 +373,30 @@ with compare_tab:
             with col_orig_b:
                 st.markdown("**Original Snowflake SQL**")
                 st.code(raw_snow, language="sql")
+
+        st.markdown("#### Snowflake translation from the T-SQL EXP")
+        translated_sql, translate_notes = t_sql_to_snowflake(raw_tsql, schema_map)
+        st.code(translated_sql, language="sql")
+
+        download_name = "translated_from_tsql.sql"
+        if tsql_file and tsql_file.name:
+            base_name = re.sub(r"[^A-Za-z0-9_-]+", "_", tsql_file.name.rsplit(".", 1)[0]) or "translated_from_tsql"
+            download_name = f"{base_name}_snowflake.sql"
+        st.download_button(
+            label="⬇️ Download translated Snowflake EXP",
+            data=make_download(translated_sql, download_name),
+            file_name=download_name,
+            mime="text/sql",
+            key="compare_translation_download",
+            use_container_width=True,
+        )
+
+        if translate_notes:
+            st.caption("Translation notes:")
+            for note in translate_notes:
+                st.write(f"- {note}")
+        else:
+            st.caption("No automatic rewrites were needed; review manually for business logic differences.")
     else:
         st.info("Provide both T-SQL and Snowflake EXPs to compare.")
 
